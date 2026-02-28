@@ -1,12 +1,18 @@
 # nl.onvergetelijk.delta
-(*FIXME: In one or two paragraphs, describe what the extension does and why one would download it. *)
 
-This is an [extension for CiviCRM](https://docs.civicrm.org/sysadmin/en/latest/customize/extensions/), licensed under [AGPL-3.0](LICENSE.txt).
+## Omschrijving
+Verwerking van wijzigingen en synchronisatie logs.
 
-## Getting Started
+## Specificaties
+* **Versie:** 2.0.0
+* **Status:** Stable
+* **CiviCRM compatibiliteit:** 6.11
+* **Maintainer:** Richard van Oosterhout
 
-(* FIXME: Where would a new user navigate to get started? What changes would they see? *)
+## Installatie
+1. Download de extensie.
+2. Plaats de map in de CiviCRM extensie directory.
+3. Activeer de extensie via de CiviCRM beheersinterface.
 
-## Known Issues
-
-(* FIXME *)
+---
+*Beheerd door Stichting Onvergetelijke Zomerkampen.*
