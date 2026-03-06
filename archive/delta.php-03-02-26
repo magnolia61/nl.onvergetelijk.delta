@@ -1,0 +1,251 @@
+<?php
+
+require_once 'delta.civix.php';
+
+use CRM_Delta_ExtensionUtil as E;
+
+/**
+ * DELTA MODULE - Stichting Onvergetelijke Zomerkampen
+ * * FUNCTIONEEL:
+ * Deze module monitort wijzigingen in contactgegevens (Core & Custom velden).
+ * Bij belangrijke wijzigingen wordt een CiviCRM Activiteit 'Notificatie aandachtspunten'
+ * aangemaakt om beheerders te informeren over updates (bv. medisch of gedrag).
+ *
+ * TECHNISCH:
+ * - Gebruikt 'base' module helper 'format_civicrm_smart' voor PHP 8.3 safety.
+ * - Repareert de 'mysqli_real_escape_string' crash door arrays naar strings te dwingen.
+ * - Alle wachthond() severity-levels zijn nu integers (1=High, 2=Normal, 3=Info, 4=Debug).
+ */
+
+/**
+ * Uitlijnings-helper: Berekent tabs voor nette weergave in de CiviCRM activiteit.
+ */
+function delta_calctabs($customFieldName) {
+    $messagelenght = strlen($customFieldName);
+    if ($messagelenght < 24 && $messagelenght >= 16) {
+        return "\t";
+    } elseif ($messagelenght < 16 && $messagelenght >= 8) {
+        return "\t\t";
+    } elseif ($messagelenght < 8) {
+        return "\t\t\t";
+    }
+    return "\t";
+}
+
+/**
+ * HOOK: civicrm_pre
+ * Wordt getriggerd bij opslaan van Core velden (Naam, Geboortedatum, Geslacht).
+ */
+function delta_civicrm_pre(string $op, $objectName, $id, array &$params): void {
+    if ($objectName !== 'Contact' || !isset($params['contact_id'])) {
+        return;
+    }
+
+    $extdebug = 0; // Niveau van debug logging voor deze functie
+    $contact_id = (int) $params['contact_id'];
+    
+    // Velden die we monitoren op wijzigingen
+    $fieldsToCheck = [
+        'first_name' => 'Voornaam',
+        'last_name'  => 'Achternaam',
+        'birth_date' => 'Geboortedatum',
+        'gender_id'  => 'Geslacht'
+    ];
+
+    // Alleen actie ondernemen als een van deze velden in de update-set zit
+    $hasChanges = false;
+    foreach ($fieldsToCheck as $key => $label) {
+        if (isset($params[$key])) {
+            $hasChanges = true;
+            break;
+        }
+    }
+    if (!$hasChanges) return;
+
+    // Severity 3 = Info niveau
+    wachthond($extdebug, 3, "### DELTA CORE PRE START voor Contact: " . $contact_id);
+
+    // Huidige data ophalen via APIv4 voor vergelijking (inclusief DITJAAR kampinfo)
+    $params_contact = [
+        'checkPermissions' => FALSE,
+        'limit' => 1,
+        'select' => [
+            'id', 'first_name', 'last_name', 'display_name', 'birth_date', 
+            'gender_id', 'gender_id:label', 'DITJAAR.DITJAAR_kampkort'
+        ],
+        'where' => [['id', '=', $contact_id]],
+    ];
+
+    $result_contact = civicrm_api4('Contact', 'get', $params_contact)->first();
+    
+    // Severity 4 = Debug resultaat van API
+    wachthond($extdebug, 4, 'result_contactinfo', $result_contact);
+
+    if (!$result_contact) return;
+
+    $changes = ['old' => [], 'new' => []];
+
+    foreach ($fieldsToCheck as $key => $label) {
+        if (isset($params[$key])) {
+            $oldRaw = $result_contact[$key] ?? '';
+            $newRaw = $params[$key];
+
+            /**
+             * PHP 8.3 FIX: format_civicrm_smart (uit base module) voorkomt crashes.
+             * Het dwingt waarden (ook arrays van checkboxes) naar vergelijkbare strings.
+             */
+            $oldVal = ($key === 'gender_id') ? ($result_contact['gender_id:label'] ?? 'Onbekend') : format_civicrm_smart($oldRaw, $key);
+            $newVal = ($key === 'gender_id') ? (($newRaw == 1) ? 'meisje' : 'jongen') : format_civicrm_smart($newRaw, $key);
+
+            if ($oldVal !== $newVal && !empty($oldRaw)) {
+                $tab = delta_calctabs($label);
+                $changes['old']['demografic'][$label] = "$label$tab: $oldVal";
+                $changes['new']['demografic'][$label] = "$label$tab: $newVal";
+            }
+        }
+    }
+
+    if (!empty($changes['new'])) {
+        delta_dispatch_activity($contact_id, $result_contact['display_name'], $changes, $result_contact);
+    }
+}
+
+/**
+ * HOOK: civicrm_customPre
+ * Wordt getriggerd bij opslaan van Custom velden (Medisch, Gedrag, Dieet).
+ */
+function delta_civicrm_customPre(string $op, int $groupID, int $entityID, array &$params): void {
+    if (!isset($params[0]['entity_table']) || $params[0]['entity_table'] !== 'civicrm_contact') {
+        return;
+    }
+
+    $extdebug = 0;
+    $contact_id = $entityID;
+    $changes = ['old' => [], 'new' => []];
+
+    wachthond($extdebug, 3, "### DELTA CUSTOM_PRE START voor Contact: " . $contact_id);
+
+    // Contactnaam en kampinfo ophalen voor context in de activiteit
+    $result_contact = civicrm_api4('Contact', 'get', [
+        'checkPermissions' => FALSE,
+        'select' => ['display_name', 'DITJAAR.DITJAAR_kampkort', 'DITJAAR.DITJAAR_rol', 'DITJAAR.DITJAAR_functie'],
+        'where' => [['id', '=', $contact_id]],
+    ])->first();
+
+    foreach ($params as $field) {
+        $fieldid    = $field['custom_field_id'] ?? NULL;
+        $fieldname  = $field['column_name']     ?? NULL;
+        $newvalue   = $field['value']           ?? NULL;
+
+        // Wijzigingsdatums (modified) negeren we voor de notificatie
+        if (!$fieldid || str_contains($fieldname, 'modified')) continue;
+
+        // Oude waarde ophalen uit database via APIv3 getvalue
+        $oldvalue = civicrm_api3('Contact', 'getvalue', [
+            'id' => $contact_id,
+            'return' => "custom_{$fieldid}",
+        ]);
+
+        /**
+         * PHP 8.3 FIX: format_civicrm_smart zorgt dat $old_formatted en $new_formatted 
+         * strings zijn. Dit voorkomt database-fouten bij checkboxes (Arrays).
+         */
+        $old_formatted = format_civicrm_smart($oldvalue, $fieldname);
+        $new_formatted = format_civicrm_smart($newvalue, $fieldname);
+
+        if ($old_formatted !== $new_formatted) {
+            // Label van het veld ophalen voor de menselijke weergave
+            $customField = civicrm_api4('CustomField', 'get', [
+                'select' => ['label', 'table_name'],
+                'where' => [['id', '=', $fieldid]],
+            ])->first();
+
+            $label = $customField['label'] ?? $fieldname;
+            $tableName = $customField['table_name'] ?? '';
+            
+            // Categorie bepalen op basis van de database tabelnaam
+            $category = 'algemeen';
+            if (str_contains($tableName, 'gedrag')) $category = 'gedrag';
+            if (str_contains($tableName, 'medisch')) $category = 'medisch';
+            if (str_contains($tableName, 'dieet'))   $category = 'dieet';
+
+            // Opschonen van CiviCRM scheidingsteken (\x01) naar leesbare komma's
+            $cleanOld = str_replace("\x01", ", ", trim($old_formatted, "\x01"));
+            $cleanNew = str_replace("\x01", ", ", trim($new_formatted, "\x01"));
+
+            $tab = delta_calctabs($label);
+            $changes['old'][$category][$label] = "$label$tab: " . (empty($cleanOld) ? '(leeg)' : $cleanOld);
+            $changes['new'][$category][$label] = "$label$tab: " . (empty($cleanNew) ? '(leeg)' : $cleanNew);
+        }
+    }
+
+    if (!empty($changes['new'])) {
+        delta_dispatch_activity($contact_id, $result_contact['display_name'] ?? "Contact $contact_id", $changes, $result_contact);
+    }
+
+    wachthond($extdebug, 3, "### DELTA CUSTOM_PRE EINDE ###");
+}
+
+/**
+ * FUNCTIONEEL: Bereidt de teksten voor en start de aanmaak van de activiteit.
+ */
+function delta_dispatch_activity($contact_id, $displayname, $changes, $contactData) {
+
+    $extdebug = 0; // Niveau van debug logging voor deze functie
+
+    $detailsOld = "";
+    foreach ($changes['old'] as $cat => $fields) {
+        $detailsOld .= "<b>[" . strtoupper($cat) . "]</b><br>" . implode("<br>", $fields) . "<br>";
+    }
+    
+    $detailsNew = "";
+    foreach ($changes['new'] as $cat => $fields) {
+        $detailsNew .= "<b>[" . strtoupper($cat) . "]</b><br>" . implode("<br>", $fields) . "<br>";
+    }
+
+    $activityParams = [
+        'displayname'     => $displayname,
+        'deltacategory'   => 'Profielupdate',
+        'deltadetailsold' => $detailsOld,
+        'deltadetailsnew' => $detailsNew,
+        'kampkort'        => $contactData['DITJAAR.DITJAAR_kampkort'] ?? NULL,
+        'kamprol'         => $contactData['DITJAAR.DITJAAR_rol']      ?? NULL,
+        'prioriteit_id'   => 2, // 2 = Normaal
+    ];
+
+    delta_activity_create($contact_id, $activityParams);
+}
+
+/**
+ * TECHNISCH: De daadwerkelijke aanroep naar CiviCRM om de activiteit in de database te zetten.
+ */
+function delta_activity_create(int $contactid, array $activityparams) {
+
+    $extdebug = 0; // Niveau van debug logging voor deze functie
+    $today_datetime = date("Y-m-d H:i:s");
+
+    $params_activity = [
+        'checkPermissions' => FALSE,
+        'values' => [
+            'source_contact_id'         => 1, // Systeem/Admin
+            'target_contact_id'         => $contactid,
+            'activity_type_id:name'     => 'Notificatie aandachtspunten',
+            'subject'                   => 'Delta: ' . $activityparams['deltacategory'],
+            'details'                   => '<h3>OUD:</h3>' . $activityparams['deltadetailsold'] . '<h3>NIEUW:</h3>' . $activityparams['deltadetailsnew'],
+            'status_id:name'            => 'Completed',
+            'priority_id'               => $activityparams['prioriteit_id'],
+            'ACT_ALG.actcontact_naam'   => $activityparams['displayname'],
+            'ACT_ALG.kampnaam'          => $activityparams['kampkort'],
+            'ACT_ALG.modified'          => $today_datetime,
+        ],
+    ];
+
+    try {
+        civicrm_api4('Activity', 'create', $params_activity);
+        // Severity 3 = Info
+        wachthond($extdebug, 3, "DELTA - Activiteit aangemaakt voor Contact: " . $contactid);
+    } catch (\Exception $e) {
+        // Severity 1 = Error/Kritiek
+        wachthond($extdebug, 1, "DELTA - FOUT bij aanmaken activiteit: " . $e->getMessage());
+    }
+}
